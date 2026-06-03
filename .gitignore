@@ -1,0 +1,31 @@
+# Secrets — never commit the real API key
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / agent
+.claude/
+.vscode/
+.idea/
+
+# SQLite WAL sidecar files
+*.db-wal
+*.db-shm
+
+# Large training artifacts and data (not needed to run the app)
+runs/
+yolo_dataset/
+frames/
+*.zip
+video.mp4
+
+# Pretrained weights (auto-downloaded by ultralytics on first run)
+yolo11n.pt
+yolo26n.pt
+yolov8n.pt
+yolov8n.pt.*

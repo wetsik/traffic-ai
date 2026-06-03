@@ -1,0 +1,18 @@
+# ByteTrack tuned for a busy fixed-camera street scene.
+#
+# The big crowd win here is track_buffer: an identity survives long occlusions
+# (a person/car passing behind a bus, lamp post, or each other) and is
+# re-attached to the SAME id when it reappears, instead of becoming a new track
+# that misses the line crossing. This has no false-positive cost.
+#
+# new_track_thresh is kept high so only confident detections can START a new
+# track — this stops weak false positives (e.g. wall ornaments scored low by the
+# model) from ever becoming counted tracks. track_low_thresh stays lower so weak
+# detections can still CONTINUE an existing real track through occlusion.
+tracker_type: bytetrack
+track_high_thresh: 0.35
+track_low_thresh: 0.15
+new_track_thresh: 0.45
+track_buffer: 90
+match_thresh: 0.85
+fuse_score: True
