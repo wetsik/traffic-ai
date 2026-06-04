@@ -1,0 +1,10 @@
+# Full local environment — includes the live YOLO detector stack.
+# Install with:  pip install -r requirements-local.txt
+ultralytics==8.4.47
+torch==2.5.1
+streamlit==1.56.0
+plotly==5.24.1
+groq==1.4.0
+opencv-python==4.13.0.92
+streamlit-webrtc==0.72.1
+av==16.1.0

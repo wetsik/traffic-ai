@@ -10,14 +10,15 @@ from typing import Any
 if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import av
+import os
+
 import cv2
 import plotly.graph_objects as go
 import streamlit as st
-from aiortc.contrib.media import MediaPlayer
-from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
-from ultralytics import YOLO
 
+# Heavy / optional dependencies (torch via ultralytics, streamlit-webrtc, av,
+# aiortc) are imported lazily inside the Live tab so the cloud BI deployment can
+# run without them. See _render_live_tab().
 from agent.agent import TrafficAnalyticsAgent
 from config import load_dotenv_file
 from db.database import get_daily_summary, get_last_3h, insert_detection
@@ -74,6 +75,16 @@ st.set_page_config(
     initial_sidebar_state='expanded',
 )
 load_dotenv_file()
+
+# On Streamlit Community Cloud there is no .env file; the GROQ key is provided
+# through the app's Secrets. Bridge it into the environment so the agent (which
+# reads os.getenv) picks it up the same way it does locally.
+if 'GROQ_API_KEY' not in os.environ:
+    try:
+        if 'GROQ_API_KEY' in st.secrets:
+            os.environ['GROQ_API_KEY'] = str(st.secrets['GROQ_API_KEY'])
+    except Exception:
+        pass
 
 
 DARK_STYLE = """
@@ -229,7 +240,9 @@ def _resolve_source() -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def _load_live_model() -> YOLO:
+def _load_live_model():
+    from ultralytics import YOLO
+
     return YOLO(str(YOLO_MODEL_PATH))
 
 
@@ -242,86 +255,117 @@ LIVE_STATE: dict[str, Any] = {
 }
 
 
-class YOLOProcessor(VideoProcessorBase):
-    def __init__(self) -> None:
-        self.model = _load_live_model()
-        self.frame_index = 0
+def _live_dependencies():
+    """Import the heavy live-detection stack lazily.
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        try:
-            image = cv2.resize(frame.to_ndarray(format='bgr24'), (1920, 1080))
-            results = self.model.track(
-                image,
-                conf=LIVE_CONFIDENCE,
-                persist=True,
-                tracker=str(TRACKER_CONFIG_PATH),
-                verbose=False,
-                imgsz=LIVE_IMGSZ,
-                workers=0,
-            )
-            observations = extract_tracked_observations(self.model, results[0])
-            observations = list(observations)
+    Returns the needed symbols when the full local environment is installed, or
+    None on the slim cloud deployment (where torch / streamlit-webrtc / av are
+    intentionally not present). This is what auto-disables the Live detector in
+    the cloud without any extra configuration.
+    """
+    try:
+        import av
+        from aiortc.contrib.media import MediaPlayer
+        from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
 
-            with LIVE_LOCK:
-                counter: LineCrossCounter = LIVE_STATE['counter']
-                passed_now = counter.update(observations, image.shape[1], image.shape[0])
-                totals = counter.totals()
-                LIVE_STATE['latest_passed'] = dict(passed_now)
-                LIVE_STATE['latest_totals'] = dict(totals)
-                now = time.monotonic()
-                if now - LIVE_STATE['last_db_write'] >= DB_WRITE_INTERVAL_SECONDS:
-                    pending = counter.drain_pending()
-                    if any(pending.values()):
-                        try:
-                            insert_detection(
-                                pedestrians=int(pending.get('person', 0)),
-                                cars=int(pending.get('vehicle', 0)),
-                                vehicles=0,
-                            )
-                        except:
-                            pass
-                    LIVE_STATE['last_db_write'] = now
-
-            annotated = image.copy()
-            
-            annotated = draw_tracking_overlay(
-                annotated,
-                observations,
-                totals,
-                passed_now,
-                counter,
-            )
-            self.frame_index += 1
-            return av.VideoFrame.from_ndarray(annotated, format='bgr24')
-        except Exception as e:
-            return av.VideoFrame.from_ndarray(image, format='bgr24')
+        return av, MediaPlayer, VideoProcessorBase, WebRtcMode, webrtc_streamer
+    except ImportError:
+        return None
 
 
 def _render_live_tab() -> None:
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
     st.subheader('Live')
-    st.caption('Live detector video with YOLO annotations.')
 
-    st.text_input(
-        'Video source',
-        value=_resolve_source(),
-        key='video_source',
-        help='Use a local file path like video.mp4 or an RTSP URL.',
-    )
+    deps = _live_dependencies()
+    if deps is None:
+        st.caption('Live YOLO detection is available in the local app only.')
+        st.info(
+            'The live detector relies on the YOLO model and a video runtime, so '
+            'it is disabled in this cloud BI demo. Run the app locally to use it. '
+            'The analytics below are served from the recorded database.'
+        )
+    else:
+        av, MediaPlayer, VideoProcessorBase, WebRtcMode, webrtc_streamer = deps
 
-    source = _resolve_source()
-    player_factory = (lambda: MediaPlayer(source, loop=True)) if Path(source).exists() else (lambda: MediaPlayer(source))
+        class YOLOProcessor(VideoProcessorBase):
+            def __init__(self) -> None:
+                self.model = _load_live_model()
+                self.frame_index = 0
 
-    webrtc_ctx = webrtc_streamer(
-        key=f'yolo-{source}',
-        mode=WebRtcMode.RECVONLY,
-        player_factory=player_factory,
-        video_processor_factory=YOLOProcessor,
-        media_stream_constraints={'video': True, 'audio': False},
-    )
+            def recv(self, frame):
+                try:
+                    image = cv2.resize(frame.to_ndarray(format='bgr24'), (1920, 1080))
+                    results = self.model.track(
+                        image,
+                        conf=LIVE_CONFIDENCE,
+                        persist=True,
+                        tracker=str(TRACKER_CONFIG_PATH),
+                        verbose=False,
+                        imgsz=LIVE_IMGSZ,
+                        workers=0,
+                    )
+                    observations = extract_tracked_observations(self.model, results[0])
+                    observations = list(observations)
 
-    status = 'Detector running' if webrtc_ctx.state.playing else 'Detector stopped'
-    st.info(status)
+                    with LIVE_LOCK:
+                        counter: LineCrossCounter = LIVE_STATE['counter']
+                        passed_now = counter.update(observations, image.shape[1], image.shape[0])
+                        totals = counter.totals()
+                        LIVE_STATE['latest_passed'] = dict(passed_now)
+                        LIVE_STATE['latest_totals'] = dict(totals)
+                        now = time.monotonic()
+                        if now - LIVE_STATE['last_db_write'] >= DB_WRITE_INTERVAL_SECONDS:
+                            pending = counter.drain_pending()
+                            if any(pending.values()):
+                                try:
+                                    insert_detection(
+                                        pedestrians=int(pending.get('person', 0)),
+                                        cars=int(pending.get('vehicle', 0)),
+                                        vehicles=0,
+                                    )
+                                except:
+                                    pass
+                            LIVE_STATE['last_db_write'] = now
+
+                    annotated = image.copy()
+
+                    annotated = draw_tracking_overlay(
+                        annotated,
+                        observations,
+                        totals,
+                        passed_now,
+                        counter,
+                    )
+                    self.frame_index += 1
+                    return av.VideoFrame.from_ndarray(annotated, format='bgr24')
+                except Exception:
+                    return av.VideoFrame.from_ndarray(image, format='bgr24')
+
+        st.caption('Live detector video with YOLO annotations.')
+
+        st.text_input(
+            'Video source',
+            value=_resolve_source(),
+            key='video_source',
+            help='Use a local file path like video.mp4 or an RTSP URL.',
+        )
+
+        source = _resolve_source()
+        player_factory = (
+            (lambda: MediaPlayer(source, loop=True)) if Path(source).exists() else (lambda: MediaPlayer(source))
+        )
+
+        webrtc_ctx = webrtc_streamer(
+            key=f'yolo-{source}',
+            mode=WebRtcMode.RECVONLY,
+            player_factory=player_factory,
+            video_processor_factory=YOLOProcessor,
+            media_stream_constraints={'video': True, 'audio': False},
+        )
+
+        status = 'Detector running' if webrtc_ctx.state.playing else 'Detector stopped'
+        st.info(status)
 
     rows = get_last_3h()
     st.markdown('#### Last 3 hours')
